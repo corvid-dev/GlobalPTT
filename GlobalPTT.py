@@ -8,6 +8,7 @@ from tkinter import ttk
 import threading
 import queue
 import json
+import sys
 import os
 import sounddevice as sd
 from pynput import keyboard, mouse
@@ -184,6 +185,7 @@ class PushToTalkApp:
         self.root.configure(bg=APP_BG)
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(100, self._set_icon)
 
         self._lock             = threading.RLock()
         self._prefs            = load_prefs()
@@ -205,6 +207,15 @@ class PushToTalkApp:
         self._populate_devices()
         self._start_listeners()
         self._gate_q.put(("mute", True))
+
+    # ── icon ──────────────────────────────────────────────────────────────────
+
+    def _set_icon(self):
+        try:
+            base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+            self.root.wm_iconbitmap(os.path.join(base, "GlobalPTTIcon.ico"))
+        except Exception:
+            pass
 
     # ── gate worker ───────────────────────────────────────────────────────────
 
