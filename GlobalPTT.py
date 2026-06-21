@@ -185,7 +185,6 @@ class PushToTalkApp:
         self.root.configure(bg=APP_BG)
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(100, self._set_icon)
 
         self._lock             = threading.RLock()
         self._prefs            = load_prefs()
@@ -207,9 +206,13 @@ class PushToTalkApp:
         self._populate_devices()
         self._start_listeners()
         self._gate_q.put(("mute", True))
-        self.root.after(50, self._fit_window)
 
-    # ── icon ──────────────────────────────────────────────────────────────────
+        # icon and fit done synchronously after layout is complete
+        self.root.update_idletasks()
+        self._set_icon()
+        self._fit_window()
+
+    # ── icon + fit ────────────────────────────────────────────────────────────
 
     def _set_icon(self):
         try:
@@ -295,7 +298,7 @@ class PushToTalkApp:
         self._bind_rows: list[tk.Frame] = []
 
         btn_frame = tk.Frame(root, bg=APP_BG)
-        btn_frame.grid(row=10, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 16))
+        btn_frame.grid(row=10, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 32))
 
         self._add_btn = tk.Button(btn_frame, text="+ Add Key",
                                    bg=PANEL_BG, fg=TEXT, font=FONT,
@@ -374,7 +377,8 @@ class PushToTalkApp:
                       activebackground=PANEL_BG, activeforeground=ACCENT_OFF,
                       command=lambda l=label: self._remove_bind(l)).pack(side="right", padx=4)
             self._bind_rows.append(row)
-        self.root.after(10, self._fit_window)
+        if self._running:
+            self._fit_window()
 
     def _save_keybinds(self):
         self._prefs["keybinds"] = self._keybinds
@@ -542,8 +546,6 @@ def main():
         pass
     root = tk.Tk()
     root.minsize(280, 100)
-    app = PushToTalkApp(root)
-    root.mainloop()
     PushToTalkApp(root)
     root.mainloop()
 
