@@ -207,6 +207,7 @@ class PushToTalkApp:
         self._populate_devices()
         self._start_listeners()
         self._gate_q.put(("mute", True))
+        self.root.after(50, self._fit_window)
 
     # ── icon ──────────────────────────────────────────────────────────────────
 
@@ -216,6 +217,10 @@ class PushToTalkApp:
             self.root.wm_iconbitmap(os.path.join(base, "GlobalPTTIcon.ico"))
         except Exception:
             pass
+
+    def _fit_window(self):
+        self.root.update_idletasks()
+        self.root.geometry(f"{self.root.winfo_width()}x{self.root.winfo_reqheight()}")
 
     # ── gate worker ───────────────────────────────────────────────────────────
 
@@ -266,16 +271,31 @@ class PushToTalkApp:
 
         tk.Frame(root, bg="#333", height=1).grid(row=4, column=0, columnspan=2, sticky="ew", padx=10)
 
+        tk.Label(root, text="Release Delay (ms)",
+                 bg=APP_BG, fg=MUTED, font=FONT_SM, anchor="w").grid(
+            row=5, column=0, sticky="w", padx=10, pady=(8, 2))
+
+        self._delay_var = tk.IntVar(value=self._prefs.get("release_delay_ms", 250))
+        tk.Scale(root, variable=self._delay_var,
+                 from_=0, to=2000, orient="horizontal",
+                 bg=APP_BG, fg=TEXT, troughcolor=PANEL_BG,
+                 highlightthickness=0, bd=0,
+                 activebackground=ACCENT, font=FONT_SM,
+                 sliderlength=14, length=220).grid(
+            row=6, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 2))
+
+        tk.Frame(root, bg="#333", height=1).grid(row=7, column=0, columnspan=2, sticky="ew", padx=10)
+
         tk.Label(root, text="Keybinds (any triggers PTT)",
                  bg=APP_BG, fg=MUTED, font=FONT_SM, anchor="w").grid(
-            row=5, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 2))
+            row=8, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 2))
 
         self._bind_frame = tk.Frame(root, bg=PANEL_BG, bd=0)
-        self._bind_frame.grid(row=6, column=0, columnspan=2, sticky="ew", padx=10)
+        self._bind_frame.grid(row=9, column=0, columnspan=2, sticky="ew", padx=10)
         self._bind_rows: list[tk.Frame] = []
 
         btn_frame = tk.Frame(root, bg=APP_BG)
-        btn_frame.grid(row=7, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
+        btn_frame.grid(row=10, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 16))
 
         self._add_btn = tk.Button(btn_frame, text="+ Add Key",
                                    bg=PANEL_BG, fg=TEXT, font=FONT,
@@ -286,21 +306,6 @@ class PushToTalkApp:
 
         self._capture_lbl = tk.Label(btn_frame, text="", bg=APP_BG, fg=ACCENT, font=FONT_SM)
         self._capture_lbl.pack(side="left", padx=(8, 0))
-
-        tk.Frame(root, bg="#333", height=1).grid(row=8, column=0, columnspan=2, sticky="ew", padx=10)
-
-        tk.Label(root, text="Release Delay (ms)",
-                 bg=APP_BG, fg=MUTED, font=FONT_SM, anchor="w").grid(
-            row=9, column=0, sticky="w", padx=10, pady=(8, 2))
-
-        self._delay_var = tk.IntVar(value=self._prefs.get("release_delay_ms", 250))
-        tk.Scale(root, variable=self._delay_var,
-                 from_=0, to=2000, orient="horizontal",
-                 bg=APP_BG, fg=TEXT, troughcolor=PANEL_BG,
-                 highlightthickness=0, bd=0,
-                 activebackground=ACCENT, font=FONT_SM,
-                 sliderlength=14, length=220).grid(
-            row=10, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
 
         root.columnconfigure(0, weight=1)
         self._style_combobox()
@@ -369,6 +374,7 @@ class PushToTalkApp:
                       activebackground=PANEL_BG, activeforeground=ACCENT_OFF,
                       command=lambda l=label: self._remove_bind(l)).pack(side="right", padx=4)
             self._bind_rows.append(row)
+        self.root.after(10, self._fit_window)
 
     def _save_keybinds(self):
         self._prefs["keybinds"] = self._keybinds
@@ -529,8 +535,15 @@ class PushToTalkApp:
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    try:
+        from ctypes import windll
+        windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
     root = tk.Tk()
-    root.minsize(280, 340)
+    root.minsize(280, 100)
+    app = PushToTalkApp(root)
+    root.mainloop()
     PushToTalkApp(root)
     root.mainloop()
 
