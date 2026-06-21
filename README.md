@@ -40,6 +40,7 @@ Settings are saved automatically to `%APPDATA%\GlobalPTT\prefs.json`.
 ## Notes
 
 - If using Elgato Wave Link, select the **Stream Mix** device rather than the raw mic input
+- If you are unable to gate your device, you may need to add the gate to a virtual audio cable type device such as VAC Lite and select that device in your application.
 - The application works when minimized or in the background
 - Original mic mute state is restored on exit
 
