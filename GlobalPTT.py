@@ -286,7 +286,7 @@ class PushToTalkApp:
 
         tk.Frame(root, bg="#333", height=1).grid(row=7, column=0, columnspan=2, sticky="ew", padx=10)
 
-        tk.Label(root, text="Keybinds (any triggers PTT)",
+        tk.Label(root, text="Keybinds",
                  bg=APP_BG, fg=MUTED, font=FONT_SM, anchor="w").grid(
             row=8, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 2))
 
