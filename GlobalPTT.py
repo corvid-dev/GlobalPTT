@@ -25,6 +25,8 @@ ACCENT_OFF = "#e17055"
 TEXT       = "#ececec"
 MUTED      = "#888888"
 
+NO_DEVICE = "— None —"
+
 MOUSE_MAP = {
     mouse.Button.left:   "Mouse-Left",
     mouse.Button.right:  "Mouse-Right",
@@ -123,8 +125,11 @@ class WinMicGate:
     def attach(self, device_name: str) -> str:
         """
         Attach to the named capture device.
-        Returns the resolved friendly name on success, '' on failure.
+        Returns NO_DEVICE if intentionally empty, friendly name on success, '' on failure.
         """
+        if not device_name or device_name == NO_DEVICE:
+            return NO_DEVICE
+
         self._volume = None
         needle = device_name.lower().strip()
 
@@ -227,9 +232,9 @@ class GateWorker:
                     g.restore()
                     g.detach()
                     name = g.attach(arg)
-                    if name:
+                    if name and name != NO_DEVICE:
                         g.set_mute(True)
-                    self._on_attach_result(slot, bool(name))
+                    self._on_attach_result(slot, name)
 
                 elif cmd == "mute":
                     self._gates[slot].set_mute(arg)
@@ -265,7 +270,7 @@ class PTTChannel:
         self._keybinds: list[str]         = list(ch_prefs.get("keybinds", []))
         self._talking                     = False
         self._release_timer: threading.Timer | None = None
-        self._device_name                 = ch_prefs.get("device_name", "")
+        self._device_name                 = ch_prefs.get("device_name", NO_DEVICE)
         self._device_index: int | None    = None
         self._device_indices: list[int]   = []
         self._delay_var: tk.IntVar | None = None
@@ -298,9 +303,9 @@ class PTTChannel:
         tk.Label(header, text=f"Channel {self.slot + 1}",
                  bg=PANEL_BG, fg=MUTED, font=("Segoe UI", 8, "bold"),
                  anchor="w").pack(side="left", padx=10, pady=6)
-        self._status_var = tk.StringVar(value="● MUTED")
+        self._status_var = tk.StringVar(value="○ INACTIVE")
         self._status_lbl = tk.Label(header, textvariable=self._status_var,
-                                    bg=PANEL_BG, fg=ACCENT_OFF,
+                                    bg=PANEL_BG, fg=MUTED,
                                     font=("Segoe UI", 9, "bold"), anchor="e")
         self._status_lbl.pack(side="right", padx=10, pady=6)
 
@@ -309,21 +314,23 @@ class PTTChannel:
         body = tk.Frame(self.frame, bg=COL_BG)
         body.pack(fill="both", expand=True, padx=10, pady=8)
 
-        # device
+        # device — NO_DEVICE always at index 0
         tk.Label(body, text="Input Device", bg=COL_BG, fg=MUTED,
                  font=("Segoe UI", 8), anchor="w").pack(fill="x")
         self._device_cb = ttk.Combobox(body, state="readonly", font=("Segoe UI", 9))
-        self._device_cb["values"] = device_names
+        self._device_cb["values"] = [NO_DEVICE] + device_names
         self._device_cb.pack(fill="x", pady=(2, 8))
         self._device_cb.bind("<<ComboboxSelected>>", self._on_device_change)
 
         saved = self._device_name
-        sel = next((i for i, n in enumerate(device_names)
+        sel = next((i + 1 for i, n in enumerate(device_names)
                     if n.lower() == saved.lower()), 0)
-        if device_names:
-            self._device_cb.current(sel)
-            self._device_index = device_indices[sel]
-            self._device_name  = device_names[sel]
+        self._device_cb.current(sel)
+        if sel > 0:
+            self._device_index = device_indices[sel - 1]
+            self._device_name  = device_names[sel - 1]
+        else:
+            self._device_name = NO_DEVICE
 
         tk.Frame(body, bg=DIVIDER, height=1).pack(fill="x", pady=(0, 8))
 
@@ -364,18 +371,26 @@ class PTTChannel:
 
     def _on_device_change(self, _event=None):
         sel = self._device_cb.current()
-        if sel >= 0:
-            self._device_index = self._device_indices[sel]
+        if sel == 0:
+            self._device_name  = NO_DEVICE
+            self._device_index = None
+            self._save()
+            self.gate_q.put(("attach", self.slot, NO_DEVICE))
+        elif sel > 0:
+            self._device_index = self._device_indices[sel - 1]
             self._device_name  = self._device_cb["values"][sel]
             self._save()
             self.gate_q.put(("attach", self.slot, self._device_name))
 
     def attach_initial(self):
-        if self._device_name:
+        if self._device_name and self._device_name != NO_DEVICE:
             self.gate_q.put(("attach", self.slot, self._device_name))
 
     def on_attach_ok(self):
         self.root.after(0, self._set_muted_ui)
+
+    def on_attach_none(self):
+        self.root.after(0, self._set_inactive_ui)
 
     def on_attach_fail(self):
         self.root.after(0, lambda: self._set_error_ui("Mic not found"))
@@ -455,6 +470,8 @@ class PTTChannel:
             self._ptt_deactivate()
 
     def _ptt_activate(self):
+        if self._device_name == NO_DEVICE:
+            return
         with self._lock:
             if self._release_timer:
                 self._release_timer.cancel()
@@ -510,6 +527,10 @@ class PTTChannel:
         self._status_var.set("● MUTED")
         self._status_lbl.config(fg=ACCENT_OFF)
 
+    def _set_inactive_ui(self):
+        self._status_var.set("○ INACTIVE")
+        self._status_lbl.config(fg=MUTED)
+
     def _set_error_ui(self, msg: str):
         self._status_var.set(f"⚠ {msg[:24]}")
         self._status_lbl.config(fg=ACCENT_OFF)
@@ -551,9 +572,14 @@ class PushToTalkApp:
         except Exception:
             pass
 
-    def _on_attach_result(self, slot: int, ok: bool):
+    def _on_attach_result(self, slot: int, name: str):
         ch = self._channels[slot]
-        ch.on_attach_ok() if ok else ch.on_attach_fail()
+        if name == NO_DEVICE:
+            ch.on_attach_none()
+        elif name:
+            ch.on_attach_ok()
+        else:
+            ch.on_attach_fail()
 
     def _build_ui(self):
         devices = sd.query_devices()
