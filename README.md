@@ -1,6 +1,6 @@
 # GlobalPTT
 
-A lightweight push-to-talk application for Windows 11. Mutes your microphone system-wide until a key or mouse button is held. Works across all applications without virtual audio cables.
+A lightweight push-to-talk application for Windows 11. Mutes your microphone system-wide until a key or mouse button is held. Works across all applications without virtual audio cables. Tested only with Elgato WaveLink / WaveXLR only. Your mileage may vary.
 
 ## Requirements
 
