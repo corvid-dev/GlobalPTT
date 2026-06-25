@@ -17,6 +17,8 @@ from pynput import keyboard, mouse
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize, CoCreateInstance, GUID
 
+VERSION = "1.41"
+
 # ── constants ─────────────────────────────────────────────────────────────────
 APP_BG     = "#1e1e1e"
 PANEL_BG   = "#2a2a2a"
@@ -565,7 +567,7 @@ class PTTChannel:
 class PushToTalkApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Push to Talk")
+        self.root.title(f"GlobalPTT - Push to Talk - v{VERSION}")
         self.root.configure(bg=APP_BG)
         self.root.resizable(True, False)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
