@@ -53,6 +53,12 @@ KEY_DISPLAY = {
 }
 
 _DISPLAY_CACHE: dict[str, str] = {}
+
+# Devices whose sounddevice name differs from their COM friendly name.
+# Key: normalized sounddevice name, value: normalized COM name.
+DEVICE_NAME_ALIASES: dict[str, str] = {
+    "line1(virtualcable1)": "line1(virtualaudiocable)",
+}
 _CLSID_MMDeviceEnumerator = GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
 _PKEY_Device_FriendlyName = GUID("{a45c254e-df1c-4efd-8020-67d146a850e0}")
 
@@ -148,20 +154,50 @@ class WinMicGate:
         return ""
 
     @staticmethod
-    def _capture_endpoints():
+    def build_name_map() -> dict:
+        """
+        Build a map of normalized_name -> COM device ID string.
+        Must be called on a COM-initialized thread.
+        Covers both capture and render endpoints so VAC/virtual devices are found.
+        """
         from pycaw.pycaw import IMMDeviceEnumerator
-        col = CoCreateInstance(
-            _CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_ALL
-        ).EnumAudioEndpoints(2, 1)
-        for i in range(col.GetCount()):
-            yield col.Item(i)
+        name_map = {}
+        try:
+            enumerator = CoCreateInstance(
+                _CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_ALL)
+            seen = set()
+            for data_flow in (2, 0):  # eCapture, eRender
+                col = enumerator.EnumAudioEndpoints(data_flow, 1)
+                for i in range(col.GetCount()):
+                    ep = col.Item(i)
+                    try:
+                        ep_id = ep.GetId()
+                        if ep_id in seen:
+                            continue
+                        seen.add(ep_id)
+                        friendly = WinMicGate._friendly_name(ep)
+                        if friendly:
+                            norm = ''.join(friendly.lower().split())
+                            name_map[norm] = ep_id
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return name_map
+
+    def _activate_by_id(self, ep_id: str):
+        """Activate a device by its COM endpoint ID string."""
+        from pycaw.pycaw import IMMDeviceEnumerator
+        enumerator = CoCreateInstance(
+            _CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_ALL)
+        ep = enumerator.GetDevice(ep_id)
+        self._activate(ep)
 
     def _activate(self, ep):
         iface = ep.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
         self._vol = iface.QueryInterface(IAudioEndpointVolume)
         self._orig_mute   = bool(self._vol.GetMute())
         self._orig_volume = self._vol.GetMasterVolumeLevelScalar()
-        # probe whether SetMute actually works
         try:
             self._vol.SetMute(1, None)
             self._fallback = not bool(self._vol.GetMute())
@@ -169,28 +205,21 @@ class WinMicGate:
         except Exception:
             self._fallback = True
 
-    def attach(self, name: str) -> str:
+    def attach(self, name: str, name_map: dict) -> str:
+        """Attach using COM device ID looked up from name_map."""
         if not name or name == NO_DEVICE:
             return NO_DEVICE
         self._vol = None
-        needle = name.lower().strip()
-        candidates = []
+        needle = ''.join(name.lower().split())
+        needle = DEVICE_NAME_ALIASES.get(needle, needle)
+        ep_id = name_map.get(needle)
+        if not ep_id:
+            return ""
         try:
-            mic = AudioUtilities.GetMicrophone()
-            if mic:
-                candidates.append(mic)
+            self._activate_by_id(ep_id)
+            return needle
         except Exception:
-            pass
-        try:
-            candidates.extend(self._capture_endpoints())
-        except Exception:
-            pass
-        for ep in candidates:
-            friendly = self._friendly_name(ep).lower().strip()
-            if friendly and (friendly.startswith(needle) or needle.startswith(friendly)):
-                self._activate(ep)
-                return friendly
-        return ""
+            return ""
 
     def set_mute(self, muted: bool):
         if not self._vol:
@@ -234,6 +263,8 @@ class GateWorker:
     def run(self):
         CoInitialize()
         try:
+            # build name->COM_id map once on this COM thread
+            self._name_map = WinMicGate.build_name_map()
             while True:
                 try:
                     cmd, uid, arg = self._q.get(timeout=0.2)
@@ -243,7 +274,7 @@ class GateWorker:
                 if cmd == "attach":
                     g = self._gates.setdefault(uid, WinMicGate())
                     g.restore(); g._vol = None
-                    name = g.attach(arg)
+                    name = g.attach(arg, self._name_map)
                     if name and name != NO_DEVICE:
                         g.set_mute(True)
                     self._on_attach(uid, name)
