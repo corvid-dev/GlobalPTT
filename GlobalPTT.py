@@ -1,799 +1,520 @@
 """
-GlobalPTT — Push-to-Talk for Windows 11
-Requirements: pip install pynput pycaw comtypes
+GlobalPTT v2.1 — Push-to-Talk for Windows 11
+pip install pynput pycaw comtypes
 """
-
+import os, sys, json, uuid, queue, threading
+from dataclasses import dataclass, field
+from functools import lru_cache
 import tkinter as tk
 from tkinter import ttk
-import threading
-import queue
-import json
-import sys
-import os
-import uuid
-from dataclasses import dataclass, field
 from pynput import keyboard, mouse
 from pycaw.pycaw import IAudioEndpointVolume, IMMDeviceEnumerator
 from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize, CoCreateInstance, GUID
 
-VERSION = "1.44"
+VERSION = "2.1"
 
-# ── constants ─────────────────────────────────────────────────────────────────
-APP_BG     = "#1e1e1e"
-PANEL_BG   = "#2a2a2a"
-COL_BG     = "#252525"
-DIVIDER    = "#333333"
-ACCENT     = "#00b894"
-ACCENT_OFF = "#e17055"
-TEXT       = "#ececec"
-MUTED      = "#888888"
+# theme
+APP_BG=("#1e1e1e"); PANEL_BG="#2a2a2a"; COL_BG="#252525"; DIVIDER="#333333"
+ACCENT="#00b894"; ACCENT_OFF="#e17055"; TEXT="#ececec"; MUTED="#888888"
 
-NO_DEVICE  = "— None —"
-COL_WIDTH  = 200
-COL_MIN_W  = 340
-COL_MIN_H  = 320
-ADD_BAR_W  = 50
+# layout
+COL_W=200; ADD_BAR_W=50; MIN_W=340; MIN_H=320
 
-PREFS_PATH = os.path.join(
-    os.environ.get("APPDATA", os.path.expanduser("~")),
-    "GlobalPTT", "prefs.json")
+# COM
+_CLSID_ENUM = GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
+_PKEY_NAME  = GUID("{a45c254e-df1c-4efd-8020-67d146a850e0}")
 
-MOUSE_MAP = {
-    mouse.Button.left:   "Mouse-Left",
-    mouse.Button.right:  "Mouse-Right",
-    mouse.Button.middle: "Mouse-Middle",
-    mouse.Button.x1:     "Mouse-X1",
-    mouse.Button.x2:     "Mouse-X2",
+PREFS_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "GlobalPTT", "prefs.json")
+
+MOUSE_LABELS = {
+    mouse.Button.left:"Mouse-Left", mouse.Button.right:"Mouse-Right",
+    mouse.Button.middle:"Mouse-Middle", mouse.Button.x1:"Mouse-X1", mouse.Button.x2:"Mouse-X2",
+}
+DISPLAY_NAMES = {
+    "ctrl_l":"L-Ctrl","ctrl_r":"R-Ctrl","shift_l":"L-Shift","shift_r":"R-Shift","shift":"Shift",
+    "alt_l":"L-Alt","alt_r":"R-Alt","Mouse-Left":"Mouse L","Mouse-Right":"Mouse R",
+    "Mouse-Middle":"Mouse M","Mouse-X1":"Mouse 4","Mouse-X2":"Mouse 5",
 }
 
-KEY_DISPLAY = {
-    "ctrl_l": "L-Ctrl",   "ctrl_r": "R-Ctrl",
-    "shift":  "Shift",    "shift_l": "L-Shift", "shift_r": "R-Shift",
-    "alt_l":  "L-Alt",    "alt_r":   "R-Alt",
-    "Mouse-Left": "Mouse L", "Mouse-Right": "Mouse R",
-    "Mouse-Middle": "Mouse M", "Mouse-X1": "Mouse 4", "Mouse-X2": "Mouse 5",
-}
+def key_label(k):
+    if isinstance(k, str): return k
+    try: return k.char or str(k).replace("Key.","")
+    except: return str(k).replace("Key.","")
 
-_DISPLAY_CACHE: dict[str, str] = {}
+@lru_cache(maxsize=256)
+def disp(label):
+    return DISPLAY_NAMES.get(label, label.upper() if len(label)==1 else label.title())
 
-_CLSID_MMDeviceEnumerator = GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
-_PKEY_Device_FriendlyName = GUID("{a45c254e-df1c-4efd-8020-67d146a850e0}")
+def load_prefs():
+    try:
+        with open(PREFS_PATH, encoding="utf-8") as f: return json.load(f)
+    except: return {}
+
+def save_prefs(data):
+    try:
+        os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
+        with open(PREFS_PATH,"w",encoding="utf-8") as f: json.dump(data,f,indent=2)
+    except: pass
 
 
-# ── channel state ─────────────────────────────────────────────────────────────
+# ── data ───────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ChannelState:
-    uid:              str       = field(default_factory=lambda: str(uuid.uuid4()))
-    device_name:      str       = NO_DEVICE   # stores the COM friendly name verbatim
-    keybinds:         list[str] = field(default_factory=list)
-    release_delay_ms: int       = 250
+    uid:      str       = field(default_factory=lambda: str(uuid.uuid4()))
+    ep_id:    str       = ""
+    keybinds: list[str] = field(default_factory=list)
+    delay_ms: int       = 250
 
     @staticmethod
-    def from_prefs(p: dict) -> "ChannelState":
-        return ChannelState(
-            device_name      = p.get("device_name", NO_DEVICE),
-            keybinds         = list(p.get("keybinds", [])),
-            release_delay_ms = p.get("release_delay_ms", 250),
-        )
-
-    def to_prefs(self) -> dict:
-        return {"device_name": self.device_name,
-                "keybinds":    list(self.keybinds),
-                "release_delay_ms": self.release_delay_ms}
+    def from_dict(d): return ChannelState(ep_id=d.get("ep_id",""), keybinds=list(d.get("keybinds",[])), delay_ms=d.get("delay_ms",250))
+    def to_dict(self): return {"ep_id":self.ep_id,"keybinds":list(self.keybinds),"delay_ms":self.delay_ms}
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── COM audio ──────────────────────────────────────────────────────────────────
 
-def key_to_label(k) -> str:
-    if isinstance(k, str):
-        return k
-    try:
-        return k.char or str(k).replace("Key.", "")
-    except AttributeError:
-        return str(k).replace("Key.", "")
-
-def label_to_display(label: str) -> str:
-    if label not in _DISPLAY_CACHE:
-        _DISPLAY_CACHE[label] = KEY_DISPLAY.get(
-            label, label.upper() if len(label) == 1 else label.title())
-    return _DISPLAY_CACHE[label]
-
-def mk_label(parent, text, fg=MUTED, font=("Segoe UI", 8), **kw) -> tk.Label:
-    w = tk.Label(parent, text=text, bg=parent["bg"], fg=fg, font=font, **kw)
-    w.pack(fill="x")
-    return w
-
-def mk_divider(parent):
-    tk.Frame(parent, bg=DIVIDER, height=1).pack(fill="x", pady=(0, 8))
-
-def mk_btn(parent, text, cmd, fg=TEXT, afg=TEXT, abg="#444", **kw) -> tk.Button:
-    kw.setdefault("font", ("Segoe UI", 9))
-    return tk.Button(parent, text=text, command=cmd,
-                     bg=PANEL_BG, fg=fg, relief="flat", cursor="hand2",
-                     activebackground=abg, activeforeground=afg, **kw)
-
-def load_prefs() -> dict:
-    try:
-        with open(PREFS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_prefs(data: dict):
-    try:
-        os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
-        with open(PREFS_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
-
-
-# ── Windows mic gate ──────────────────────────────────────────────────────────
-
-class WinMicGate:
+class MicGate:
     def __init__(self):
-        self._vol: IAudioEndpointVolume | None = None
-        self._orig_mute:   bool | None         = None
-        self._orig_volume: float | None        = None
-        self._fallback                         = False
+        self._vol=None; self._orig_mute=False; self._orig_vol=1.0; self._use_vol=False
 
-    @staticmethod
-    def enumerate_devices() -> dict[str, str]:
-        """Return {friendly_name: ep_id} for all active endpoints. COM thread only."""
-        def _friendly(ep) -> str:
-            try:
-                store = ep.OpenPropertyStore(0)
-                for i in range(store.GetCount()):
-                    pk = store.GetAt(i)
-                    if pk.fmtid == _PKEY_Device_FriendlyName and pk.pid == 14:
-                        return str(store.GetValue(pk).GetValue())
-            except Exception:
-                pass
-            return ""
-
-        result: dict[str, str] = {}
-        seen:   set[str]       = set()
+    def activate(self, enum, ep_id):
+        self.deactivate()
         try:
-            enumerator = CoCreateInstance(
-                _CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_ALL)
-            for data_flow in (2, 0):   # eCapture first, then eRender
-                col = enumerator.EnumAudioEndpoints(data_flow, 1)
-                for i in range(col.GetCount()):
-                    ep = col.Item(i)
-                    try:
-                        ep_id = ep.GetId()
-                        if ep_id in seen:
-                            continue
-                        seen.add(ep_id)
-                        name = _friendly(ep)
-                        if name:
-                            result[name] = ep_id
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        return result
+            vol = enum.GetDevice(ep_id).Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None).QueryInterface(IAudioEndpointVolume)
+            self._orig_mute=bool(vol.GetMute()); self._orig_vol=vol.GetMasterVolumeLevelScalar()
+            vol.SetMute(1,None); self._use_vol=not bool(vol.GetMute()); vol.SetMute(0,None)
+            self._vol=vol; return True
+        except: self.deactivate(); return False
 
-    def _activate(self, ep):
-        iface = ep.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        self._vol = iface.QueryInterface(IAudioEndpointVolume)
-        self._orig_mute   = bool(self._vol.GetMute())
-        self._orig_volume = self._vol.GetMasterVolumeLevelScalar()
+    def set_mute(self, muted):
+        if not self._vol: return
         try:
-            self._vol.SetMute(1, None)
-            self._fallback = not bool(self._vol.GetMute())
-            self._vol.SetMute(0, None)
-        except Exception:
-            self._fallback = True
+            if self._use_vol: self._vol.SetMasterVolumeLevelScalar(0.0 if muted else self._orig_vol, None)
+            else: self._vol.SetMute(int(muted), None)
+        except: pass
 
-    def set_mute(self, muted: bool):
-        if not self._vol:
-            return
+    def deactivate(self):
+        if not self._vol: return
         try:
-            if self._fallback:
-                self._vol.SetMasterVolumeLevelScalar(
-                    0.0 if muted else (self._orig_volume or 1.0), None)
-            else:
-                self._vol.SetMute(int(muted), None)
-        except Exception:
-            pass
-
-    def restore(self):
-        if not self._vol:
-            return
-        try:
-            if self._fallback and self._orig_volume is not None:
-                self._vol.SetMasterVolumeLevelScalar(self._orig_volume, None)
-            elif self._orig_mute is not None:
-                self._vol.SetMute(int(self._orig_mute), None)
-        except Exception:
-            pass
-
-    def close(self):
-        self.set_mute(False)
-        self.restore()
-        self._vol = None
+            if self._use_vol: self._vol.SetMasterVolumeLevelScalar(self._orig_vol, None)
+            else: self._vol.SetMute(int(self._orig_mute), None)
+        except: pass
+        self._vol=None
 
 
-# ── gate worker ───────────────────────────────────────────────────────────────
+class AudioThread:
+    # queue msgs: (cmd, uid, arg)
+    # enumerate: (None, None, cb)  — cb({ep_id:name}) on main thread
+    # attach:    (uid, ep_id, cb)  — cb(ok) on main thread
+    # mute:      (uid, bool, None)
+    # remove:    (uid, None, None)
+    # quit:      (None, None, None)
 
-class GateWorker:
-    """Single COM thread. Messages on _q are (cmd, uid, arg)."""
+    def __init__(self, root):
+        self._root=root; self._q=queue.Queue(); self._gates={}
 
-    def __init__(self, q: queue.Queue, on_names_ready):
-        self._q              = q
-        self._on_names_ready = on_names_ready
-        self._gates: dict[str, WinMicGate] = {}
+    def send(self, cmd, uid, arg): self._q.put((cmd,uid,arg))
 
-    def run(self):
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
         CoInitialize()
         try:
-            name_map = WinMicGate.enumerate_devices()   # {name: ep_id}
-            self._on_names_ready(list(name_map.keys()))
-
-            enumerator = CoCreateInstance(
-                _CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_ALL)
-
+            enum = CoCreateInstance(_CLSID_ENUM, IMMDeviceEnumerator, CLSCTX_ALL)
             while True:
-                try:
-                    cmd, uid, arg = self._q.get(timeout=0.2)
-                except queue.Empty:
-                    continue
+                try: cmd,uid,arg = self._q.get(timeout=0.2)
+                except queue.Empty: continue
 
-                if cmd == "attach":
-                    # arg = (device_name, on_attach_cb)
-                    name, on_attach = arg
-                    g = self._gates.setdefault(uid, WinMicGate())
-                    g.restore()
-                    g._vol = None
-                    if name and name != NO_DEVICE:
-                        ep_id = name_map.get(name)
-                        try:
-                            if ep_id:
-                                g._activate(enumerator.GetDevice(ep_id))
-                                g.set_mute(True)
-                                on_attach(name)
-                            else:
-                                on_attach("")
-                        except Exception:
-                            on_attach("")
+                if cmd=="enumerate":
+                    self._root.after(0, arg, self._enumerate(enum))
+
+                elif cmd=="attach":
+                    ep_id,cb = arg
+                    g = self._gates.setdefault(uid, MicGate())
+                    g.deactivate()
+                    if ep_id:
+                        ok = g.activate(enum, ep_id)
+                        if ok: g.set_mute(True)
+                        self._root.after(0, cb, ok)
                     else:
-                        on_attach(NO_DEVICE)
+                        self._root.after(0, cb, None)
 
-                elif cmd == "mute":
-                    if uid in self._gates:
-                        self._gates[uid].set_mute(arg)
+                elif cmd=="mute":
+                    if uid in self._gates: self._gates[uid].set_mute(arg)
 
-                elif cmd == "remove":
-                    if uid in self._gates:
-                        self._gates.pop(uid).close()
+                elif cmd=="remove":
+                    if uid in self._gates: self._gates.pop(uid).deactivate()
 
-                elif cmd == "close":
-                    for g in self._gates.values():
-                        g.close()
+                elif cmd=="quit":
+                    for g in self._gates.values(): g.deactivate()
                     break
-        finally:
-            CoUninitialize()
+        finally: CoUninitialize()
+
+    def _enumerate(self, enum):
+        result={}; seen_ids=set(); name_counts={}
+        def name(ep):
+            try:
+                store=ep.OpenPropertyStore(0)
+                for i in range(store.GetCount()):
+                    pk=store.GetAt(i)
+                    if pk.fmtid==_PKEY_NAME and pk.pid==14:
+                        return str(store.GetValue(pk).GetValue())
+            except: pass
+            return ""
+        try:
+            col=enum.EnumAudioEndpoints(2,1)
+            for i in range(col.GetCount()):
+                try:
+                    ep=col.Item(i); eid=ep.GetId()
+                    if eid in seen_ids: continue
+                    seen_ids.add(eid); n=name(ep)
+                    if not n: continue
+                    name_counts[n]=name_counts.get(n,0)+1
+                    result[eid]=f"[{name_counts[n]}] {n}" if name_counts[n]>1 else n
+                except: pass
+        except: pass
+        return result
 
 
-# ── PTT channel ───────────────────────────────────────────────────────────────
+# ── PTT channel ────────────────────────────────────────────────────────────────
 
-class PTTChannel:
-    """One UI column. state.uid is stable; display_index is cosmetic only."""
+@dataclass
+class Bridge:
+    audio:         object
+    root:          tk.Tk
+    on_save:       callable
+    on_remove:     callable
+    on_kb_add:     callable
+    on_kb_remove:  callable
+    is_capturing:  callable
+    start_capture: callable
+    end_capture:   callable
 
-    def __init__(self, state: ChannelState, display_index: int,
-                 root: tk.Tk,
-                 on_set_mute,         # (bool) -> None
-                 on_attach,           # (device_name) -> None
-                 on_remove_gate,      # () -> None
-                 is_capturing,        # () -> bool
-                 start_capture,       # () -> None
-                 finish_capture,      # (label) -> None
-                 on_keybinds_changed, # () -> None
-                 on_remove,           # (self) -> None
-                 on_change):          # () -> None
-        self.state                = state
-        self.display_index        = display_index
-        self.root                 = root
-        self._on_set_mute         = on_set_mute
-        self._on_attach           = on_attach
-        self._on_remove_gate      = on_remove_gate
-        self._is_capturing        = is_capturing
-        self._start_capture_cb    = start_capture
-        self._finish_capture      = finish_capture
-        self._on_keybinds_changed = on_keybinds_changed
-        self._on_remove           = on_remove
-        self._on_change           = on_change
 
-        self._lock          = threading.RLock()
-        self._active_keys: set[str]               = set()
-        self._talking                             = False
-        self._timer: threading.Timer | None       = None
+class Channel:
+    def __init__(self, state, index, bridge):
+        self.state=state; self.index=index; self._b=bridge
+        self._lock=threading.RLock(); self._active=set(); self._talking=False; self._timer=None
+        self._ep_map={}
+        self.frame=self._hdr=self._svar=self._slbl=self._combo=None
+        self._dvar=self._bframe=self._addbtn=self._clbl=None; self._brows=[]
 
-        self.frame          = None
-        self._divider_frame = None
-        self._header_lbl    = None
-        self._status_var    = None
-        self._status_lbl    = None
-        self._device_cb     = None
-        self._delay_var     = None
-        self._bind_frame    = None
-        self._bind_rows: list[tk.Frame]           = []
-        self._add_btn       = None
-        self._capture_lbl   = None
+    def build(self, parent):
+        self.frame=tk.Frame(parent, bg=COL_BG, width=COL_W); self.frame.pack_propagate(False)
 
-    # ── build ─────────────────────────────────────────────────────────────────
-
-    def build_column(self, parent) -> tk.Frame:
-        self.frame = tk.Frame(parent, bg=COL_BG, width=COL_WIDTH)
-        self.frame.pack_propagate(False)
-
-        # header bar
-        hdr = tk.Frame(self.frame, bg=PANEL_BG)
-        hdr.pack(fill="x")
-        self._header_lbl = tk.Label(hdr, text=f"Channel {self.display_index + 1}",
-                                    bg=PANEL_BG, fg=MUTED,
-                                    font=("Segoe UI", 8, "bold"), anchor="w")
-        self._header_lbl.pack(side="left", padx=10, pady=6)
-        mk_btn(hdr, "✕", lambda: self._on_remove(self),
-               fg=MUTED, afg=ACCENT_OFF, abg=PANEL_BG
-               ).pack(side="right", padx=(0, 4), pady=4)
-        self._status_var = tk.StringVar(value="○ INACTIVE")
-        self._status_lbl = tk.Label(hdr, textvariable=self._status_var,
-                                    bg=PANEL_BG, fg=MUTED,
-                                    font=("Segoe UI", 9, "bold"), anchor="e")
-        self._status_lbl.pack(side="right", padx=(10, 4), pady=6)
+        # header
+        hdr=tk.Frame(self.frame, bg=PANEL_BG); hdr.pack(fill="x")
+        self._hdr=tk.Label(hdr, text=self._title(), bg=PANEL_BG, fg=MUTED, font=("Segoe UI",8,"bold"), anchor="w")
+        self._hdr.pack(side="left", padx=10, pady=6)
+        tk.Button(hdr, text="✕", command=lambda:self._b.on_remove(self),
+                  bg=PANEL_BG, fg=MUTED, relief="flat", cursor="hand2",
+                  activebackground=PANEL_BG, activeforeground=ACCENT_OFF, font=("Segoe UI",9)
+                  ).pack(side="right", padx=(0,4), pady=4)
+        self._svar=tk.StringVar(value="○ INACTIVE")
+        self._slbl=tk.Label(hdr, textvariable=self._svar, bg=PANEL_BG, fg=MUTED, font=("Segoe UI",9,"bold"), anchor="e")
+        self._slbl.pack(side="right", padx=(10,4), pady=6)
         tk.Frame(self.frame, bg=DIVIDER, height=1).pack(fill="x")
 
-        body = tk.Frame(self.frame, bg=COL_BG)
-        body.pack(fill="both", expand=True, padx=10, pady=8)
-
-        # device picker — values filled in by update_device_list()
-        mk_label(body, "Input Device", anchor="w")
-        self._device_cb = ttk.Combobox(body, state="readonly", font=("Segoe UI", 9))
-        self._device_cb["values"] = [NO_DEVICE]
-        self._device_cb.current(0)
-        self._device_cb.pack(fill="x", pady=(2, 8))
-        self._device_cb.bind("<<ComboboxSelected>>", self._on_device_change)
-
-        mk_divider(body)
-
-        # release delay
-        self._delay_var = tk.IntVar(value=self.state.release_delay_ms)
-        self._delay_var.trace_add("write", self._on_delay_change)
-        mk_label(body, "Release Delay (ms)", anchor="w")
-        tk.Scale(body, variable=self._delay_var, from_=0, to=2000,
-                 orient="horizontal", bg=COL_BG, fg=TEXT, troughcolor=PANEL_BG,
-                 highlightthickness=0, bd=0, activebackground=ACCENT,
-                 font=("Segoe UI", 8), sliderlength=14
-                 ).pack(fill="x", pady=(2, 8))
-
-        mk_divider(body)
-
-        # keybinds
-        mk_label(body, "Keybinds", anchor="w")
-        self._bind_frame = tk.Frame(body, bg=PANEL_BG)
-        self._bind_frame.pack(fill="x", pady=(2, 6))
-
-        btn_row = tk.Frame(body, bg=COL_BG)
-        btn_row.pack(fill="x")
-        self._add_btn = mk_btn(btn_row, "+ Add Key", self._start_capture)
-        self._add_btn.pack(side="left")
-        self._capture_lbl = tk.Label(btn_row, text="", bg=COL_BG,
-                                      fg=ACCENT, font=("Segoe UI", 8))
-        self._capture_lbl.pack(side="left", padx=(8, 0))
-
-        self._rebuild_bind_list()
+        # body
+        b=tk.Frame(self.frame, bg=COL_BG); b.pack(fill="both", expand=True, padx=10, pady=8)
+        self._lbl(b,"Input Device")
+        self._combo=ttk.Combobox(b, state="readonly", font=("Segoe UI",9))
+        self._combo["values"]=["— None —"]; self._combo.current(0)
+        self._combo.pack(fill="x", pady=(2,8))
+        self._combo.bind("<<ComboboxSelected>>",self._on_device_selected)
+        self._div(b)
+        self._lbl(b,"Release Delay (ms)")
+        self._dvar=tk.IntVar(value=self.state.delay_ms)
+        self._dvar.trace_add("write", lambda *_: self._on_delay())
+        tk.Scale(b, variable=self._dvar, from_=0, to=2000, orient="horizontal",
+                 bg=COL_BG, fg=TEXT, troughcolor=PANEL_BG, highlightthickness=0,
+                 bd=0, activebackground=ACCENT, font=("Segoe UI",8), sliderlength=14
+                 ).pack(fill="x", pady=(2,8))
+        self._div(b)
+        self._lbl(b,"Keybinds")
+        self._bframe=tk.Frame(b, bg=PANEL_BG); self._bframe.pack(fill="x", pady=(2,6))
+        row=tk.Frame(b, bg=COL_BG); row.pack(fill="x")
+        self._addbtn=tk.Button(row, text="+ Add Key", command=self._on_add,
+                               bg=PANEL_BG, fg=TEXT, relief="flat", cursor="hand2",
+                               activebackground="#444", activeforeground=TEXT, font=("Segoe UI",9))
+        self._addbtn.pack(side="left")
+        self._clbl=tk.Label(row, text="", bg=COL_BG, fg=ACCENT, font=("Segoe UI",8))
+        self._clbl.pack(side="left", padx=(8,0))
+        self._rebuild_binds()
         return self.frame
 
-    def update_display_index(self, idx: int):
-        self.display_index = idx
-        if self._header_lbl:
-            self._header_lbl.config(text=f"Channel {idx + 1}")
+    def _lbl(self, p, t): tk.Label(p, text=t, bg=COL_BG, fg=MUTED, font=("Segoe UI",8), anchor="w").pack(fill="x")
+    def _div(self, p):    tk.Frame(p, bg=DIVIDER, height=1).pack(fill="x", pady=(0,8))
+    def _title(self):     return f"Channel {self.index+1}"
 
-    def update_device_list(self, com_names: list[str]):
-        if not self._device_cb:
-            return
-        self._device_cb["values"] = [NO_DEVICE] + com_names
-        saved = self.state.device_name
-        if saved and saved != NO_DEVICE and saved in com_names:
-            self._device_cb.current(com_names.index(saved) + 1)
+    def set_index(self, i):
+        self.index=i
+        if self._hdr: self._hdr.config(text=self._title())
+
+    # device
+    def refresh_devices(self, ep_map):
+        self._ep_map=ep_map
+        ids=list(ep_map.keys()); names=["— None —"]+list(ep_map.values())
+        self._combo["values"]=names
+        if self.state.ep_id in ids:
+            self._combo.current(ids.index(self.state.ep_id)+1)
         else:
-            self._device_cb.current(0)
-            if saved != NO_DEVICE:
-                self.state.device_name = NO_DEVICE
+            self._combo.current(0)
+            if self.state.ep_id:
+                self.state.ep_id=""; self._status("⚠ Device not found", ACCENT_OFF)
 
-    # ── device ────────────────────────────────────────────────────────────────
+    def _on_device_selected(self, _=None):
+        sel=self._combo.current()
+        self.state.ep_id="" if sel==0 else list(self._ep_map.keys())[sel-1]
+        self._attach(self.state.ep_id); self._b.on_save()
 
-    def _on_device_change(self, _=None):
-        sel = self._device_cb.current()
-        self.state.device_name = NO_DEVICE if sel == 0 else self._device_cb["values"][sel]
-        self._on_attach(self.state.device_name)
-        self._on_change()
+    def _attach(self, ep_id):
+        self._b.audio.send("attach", self.state.uid, (ep_id, self._on_attach))
 
-    def attach_initial(self):
-        if self.state.device_name != NO_DEVICE:
-            self._on_attach(self.state.device_name)
+    def _on_attach(self, ok):
+        if ok is None:  self._status("○ INACTIVE", MUTED)
+        elif ok:        self._status("● MUTED",    ACCENT_OFF)
+        else:           self._status("⚠ Mic error",ACCENT_OFF)
 
-    def on_attach_result(self, name: str):
-        if   name == NO_DEVICE: self.root.after(0, self._set_status, "○ INACTIVE", MUTED)
-        elif name:               self.root.after(0, self._set_status, "● MUTED",    ACCENT_OFF)
-        else:                    self.root.after(0, self._set_status, "⚠ Mic not found", ACCENT_OFF)
+    def _on_delay(self):
+        self.state.delay_ms=self._dvar.get(); self._b.on_save()
 
-    def _on_delay_change(self, *_):
-        self.state.release_delay_ms = self._delay_var.get()
-        self._on_change()
+    def attach_saved(self):
+        if self.state.ep_id: self._attach(self.state.ep_id)
 
-    # ── keybinds ──────────────────────────────────────────────────────────────
-
-    def _rebuild_bind_list(self):
-        for row in self._bind_rows:
-            row.destroy()
-        self._bind_rows.clear()
+    # keybinds
+    def _rebuild_binds(self):
+        for r in self._brows: r.destroy()
+        self._brows.clear()
         for label in self.state.keybinds:
-            row = tk.Frame(self._bind_frame, bg=PANEL_BG)
-            row.pack(fill="x", padx=4, pady=2)
-            tk.Label(row, text=label_to_display(label), bg=PANEL_BG, fg=TEXT,
-                     font=("Segoe UI", 9), anchor="w").pack(side="left", padx=(6, 0))
-            mk_btn(row, "✕", lambda l=label: self._remove_bind(l),
-                   fg=MUTED, afg=ACCENT_OFF, abg=PANEL_BG,
-                   font=("Segoe UI", 8)).pack(side="right", padx=4)
-            self._bind_rows.append(row)
+            r=tk.Frame(self._bframe, bg=PANEL_BG); r.pack(fill="x", padx=4, pady=2)
+            tk.Label(r, text=disp(label), bg=PANEL_BG, fg=TEXT, font=("Segoe UI",9), anchor="w").pack(side="left", padx=(6,0))
+            tk.Button(r, text="✕", command=lambda l=label:self._rm_bind(l),
+                      bg=PANEL_BG, fg=MUTED, relief="flat", cursor="hand2",
+                      activebackground=PANEL_BG, activeforeground=ACCENT_OFF, font=("Segoe UI",8)
+                      ).pack(side="right", padx=4)
+            self._brows.append(r)
 
-    def _remove_bind(self, label: str):
-        with self._lock:
-            self.state.keybinds.remove(label)
-        self._rebuild_bind_list()
-        self._on_keybinds_changed()
-        self._on_change()
+    def _rm_bind(self, label):
+        with self._lock: self.state.keybinds.remove(label)
+        self._rebuild_binds(); self._b.on_kb_remove(label,self); self._b.on_save()
 
-    def _start_capture(self):
-        if self._is_capturing():
-            return
-        self._start_capture_cb()
-        self._add_btn.config(state="disabled")
-        self._capture_lbl.config(text="Press a key…")
+    def _on_add(self):
+        if not self._b.is_capturing(self):
+            self._b.start_capture(self)
+            self._addbtn.config(state="disabled"); self._clbl.config(text="Press a key…")
 
-    def _do_finish_capture(self, label: str):
+    def accept_capture(self, label):
         with self._lock:
             if label and label not in self.state.keybinds:
-                self.state.keybinds.append(label)
-                self._rebuild_bind_list()
-                self._on_keybinds_changed()
-                self._on_change()
-        self.root.after(0, self._capture_lbl.config, {"text": ""})
-        self.root.after(0, self._add_btn.config, {"state": "normal"})
+                self.state.keybinds.append(label); self._rebuild_binds()
+                self._b.on_kb_add(label,self); self._b.on_save()
+        self._clbl.config(text=""); self._addbtn.config(state="normal")
 
-    # ── input events ──────────────────────────────────────────────────────────
-
-    def handle_press(self, label: str) -> bool:
-        if self._is_capturing():
-            self._finish_capture(label)
-            return True
+    # PTT
+    def handle_press(self, label):
         with self._lock:
-            if label in self.state.keybinds:
-                self._active_keys.add(label)
-                self._set_talking(True)
-        return False
+            if label not in self.state.keybinds: return
+            self._active.add(label)
+            if not self._talking and self.state.ep_id: self._arm()
 
-    def handle_release(self, label: str):
+    def handle_release(self, label):
+        with self._lock: self._active.discard(label)
+        if not any(k in self._active for k in self.state.keybinds): self._disarm()
+
+    def _arm(self):
+        if self._timer: self._timer.cancel(); self._timer=None
+        self._talking=True
+        self._b.audio.send("mute",self.state.uid,False)
+        self._b.root.after(0,self._status,"● LIVE",ACCENT)
+
+    def _disarm(self):
         with self._lock:
-            self._active_keys.discard(label)
-            if any(k in self._active_keys for k in self.state.keybinds):
-                return
-        self._set_talking(False)
-
-    # ── PTT state machine ─────────────────────────────────────────────────────
-
-    def _set_talking(self, talking: bool):
-        with self._lock:
-            if talking:
-                if self.state.device_name == NO_DEVICE or self._talking:
-                    return
-                if self._timer:
-                    self._timer.cancel()
-                    self._timer = None
-                self._talking = True
-                self._on_set_mute(False)
-                self.root.after(0, self._set_status, "● LIVE", ACCENT)
-            else:
-                if not self._talking:
-                    return
-                delay = self.state.release_delay_ms
-                if self._timer:
-                    self._timer.cancel()
-                if delay == 0:
-                    self._timer = None
-                    do_now = True
-                else:
-                    self._timer = threading.Timer(delay / 1000.0, self._deactivate_now)
-                    self._timer.daemon = True
-                    do_now = False
-        if talking:
-            return
-        if do_now:
-            self._deactivate_now()
+            if not self._talking: return
+            if self._timer: self._timer.cancel(); self._timer=None
+            delay=self.state.delay_ms
+        if delay==0: self._silence()
         else:
-            self._timer.start()
+            t=threading.Timer(delay/1000.0, self._silence); t.daemon=True
+            with self._lock: self._timer=t
+            t.start()
 
-    def _deactivate_now(self):
+    def _silence(self):
         with self._lock:
-            self._timer = None
-            if any(k in self._active_keys for k in self.state.keybinds):
-                return
-            if not self._talking:
-                return
-            self._talking = False
-        self._on_set_mute(True)
-        self.root.after(0, self._set_status, "● MUTED", ACCENT_OFF)
+            self._timer=None
+            if any(k in self._active for k in self.state.keybinds): return
+            if not self._talking: return
+            self._talking=False
+        self._b.audio.send("mute",self.state.uid,True)
+        self._b.root.after(0,self._status,"● MUTED",ACCENT_OFF)
 
-    def cancel_timers(self):
+    def cancel(self):
         with self._lock:
-            if self._timer:
-                self._timer.cancel()
-                self._timer = None
-            self._talking = False
+            if self._timer: self._timer.cancel(); self._timer=None
+            self._talking=False
 
-    # ── UI helpers ────────────────────────────────────────────────────────────
-
-    def _set_status(self, text: str, color: str):
-        if self._status_var:  self._status_var.set(text)
-        if self._status_lbl:  self._status_lbl.config(fg=color)
+    def _status(self, text, color):
+        if self._svar: self._svar.set(text)
+        if self._slbl: self._slbl.config(fg=color)
 
     def destroy(self):
-        self.cancel_timers()
-        self._on_set_mute(False)
-        self._on_remove_gate()
-        if self._divider_frame:
-            self._divider_frame.destroy()
-            self._divider_frame = None
-        if self.frame:
-            self.frame.destroy()
-            self.frame = None
+        self.cancel()
+        self._b.audio.send("mute",  self.state.uid, False)
+        self._b.audio.send("remove",self.state.uid, None)
+        if self.frame: self.frame.destroy(); self.frame=None
 
 
-# ── application ───────────────────────────────────────────────────────────────
+# ── app ────────────────────────────────────────────────────────────────────────
 
-class PushToTalkApp:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title(f"GlobalPTT - Push to Talk - v{VERSION}")
-        self.root.configure(bg=APP_BG)
-        self.root.resizable(True, False)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+class App:
+    def __init__(self, root):
+        self.root=root
+        root.title(f"GlobalPTT - Push to Talk - v{VERSION}")
+        root.resizable(True,True)
+        root.protocol("WM_DELETE_WINDOW", self._quit)
+        root.bind("<Configure>", self._on_root_configure)
+        self._was_zoomed=False
 
-        self._prefs          = load_prefs()
-        self._gate_q         = queue.Queue()
-        self._capturing:     PTTChannel | None           = None
-        self._keybind_index: dict[str, list[PTTChannel]] = {}
-        self._channels:      list[PTTChannel]            = []
-        self._com_names:     list[str]                   = []
+        self._prefs=load_prefs(); self._channels=[]; self._dividers=[]
+        self._kb_index={}; self._capturing=None
 
-        self._worker     = GateWorker(self._gate_q, self._on_names_ready)
-        self._gate_thread = threading.Thread(target=self._worker.run, daemon=True)
-        self._gate_thread.start()
+        self._audio=AudioThread(root); self._audio.start()
 
-        self._build_ui()
-        self._restore_channels()
-        self._start_listeners()
-        self.root.update_idletasks()
-        self._update_geometry(snap=True)
-        self._set_icon()
-
-    def _set_icon(self):
+        self._bridge=Bridge(
+            audio=self._audio, root=root,
+            on_save=self._save, on_remove=self._remove,
+            on_kb_add=self._kb_add, on_kb_remove=self._kb_rm,
+            is_capturing=lambda ch:self._capturing is ch,
+            start_capture=self._set_capture,
+            end_capture=self._end_capture,
+        )
+        self._build_ui(); self._restore()
+        self._start_input(); root.update_idletasks(); self._snap()
+        self._audio.send("enumerate", None, self._apply_ep_map)
         try:
-            base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-            self.root.wm_iconbitmap(os.path.join(base, "GlobalPTTIcon.ico"))
-        except Exception:
-            pass
-
-    # ── UI scaffold ───────────────────────────────────────────────────────────
+            base=getattr(sys,"_MEIPASS",os.path.dirname(os.path.abspath(__file__)))
+            root.wm_iconbitmap(os.path.join(base,"GlobalPTTIcon.ico"))
+        except: pass
 
     def _build_ui(self):
-        style = ttk.Style()
-        style.theme_use("default")
+        style=ttk.Style(); style.theme_use("default")
         style.configure("TCombobox", fieldbackground=PANEL_BG, background=PANEL_BG,
-                        foreground=TEXT, selectbackground=PANEL_BG,
-                        selectforeground=TEXT, bordercolor="#444", arrowcolor=TEXT)
-        style.map("TCombobox", fieldbackground=[("readonly", PANEL_BG)],
-                               foreground=[("readonly", TEXT)])
+                        foreground=TEXT, selectbackground=PANEL_BG, selectforeground=TEXT,
+                        bordercolor="#444", arrowcolor=TEXT)
+        style.map("TCombobox", fieldbackground=[("readonly",PANEL_BG)], foreground=[("readonly",TEXT)])
 
-        outer = tk.Frame(self.root, bg=APP_BG)
-        outer.pack(fill="both", expand=True)
+        outer=tk.Frame(self.root, bg=APP_BG); outer.pack(fill="both", expand=True)
+        self._canvas=tk.Canvas(outer, bg=APP_BG, highlightthickness=0)
+        sb=ttk.Scrollbar(outer, orient="horizontal", command=self._canvas.xview)
+        self._canvas.configure(xscrollcommand=sb.set)
+        sb.pack(side="bottom", fill="x"); self._canvas.pack(side="top", fill="both", expand=True)
+        self._inner=tk.Frame(self._canvas, bg=APP_BG)
+        self._cwin=self._canvas.create_window((0,0), window=self._inner, anchor="nw")
+        self._inner.bind("<Configure>", lambda _:self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>", lambda _:self._canvas.itemconfig(self._cwin, height=self._canvas.winfo_height()))
+        bar=tk.Canvas(self._inner, bg=PANEL_BG, width=ADD_BAR_W, highlightthickness=0, cursor="hand2")
+        bar.pack(side="left", fill="y")
+        def draw_bar(_=None):
+            bar.delete("all"); w,h=bar.winfo_width(),bar.winfo_height()
+            bar.create_line(0,0,0,h,fill=DIVIDER,width=1)
+            bar.create_text(w//2,h//2,text="+ Add Channel",fill=MUTED,font=("Segoe UI",9),angle=90,anchor="center")
+        bar.bind("<Configure>",draw_bar)
+        bar.bind("<Button-1>", lambda _:self._add())
+        bar.bind("<Enter>",    lambda _:bar.config(bg="#3a3a3a"))
+        bar.bind("<Leave>",    lambda _:bar.config(bg=PANEL_BG))
+        self._bar=bar
 
-        self._canvas = tk.Canvas(outer, bg=APP_BG, highlightthickness=0)
-        self._scrollbar = ttk.Scrollbar(outer, orient="horizontal",
-                                         command=self._canvas.xview)
-        self._canvas.configure(xscrollcommand=self._scrollbar.set)
-        self._scrollbar.pack(side="bottom", fill="x")
-        self._canvas.pack(side="top", fill="both", expand=True)
+    def _apply_ep_map(self, ep_map):
+        for ch in self._channels: ch.refresh_devices(ep_map)
 
-        self._inner   = tk.Frame(self._canvas, bg=APP_BG)
-        self._cwin    = self._canvas.create_window((0, 0), window=self._inner, anchor="nw")
-        self._inner.bind("<Configure>", self._on_inner_configure)
-        self._canvas.bind("<Configure>",
-                          lambda _: self._canvas.itemconfig(
-                              self._cwin, height=self._canvas.winfo_height()))
+    def _enumerate_all(self):
+        self._audio.send("enumerate", None, self._apply_ep_map)
 
-        self._add_bar = tk.Canvas(self._inner, bg=PANEL_BG, width=ADD_BAR_W,
-                                   highlightthickness=0, cursor="hand2")
-        self._add_bar.pack(side="left", fill="y")
-        self._add_bar.bind("<Configure>", self._draw_add_bar)
-        self._add_bar.bind("<Button-1>",  lambda _: self._add_channel())
-        self._add_bar.bind("<Enter>",     lambda _: self._add_bar.config(bg="#3a3a3a"))
-        self._add_bar.bind("<Leave>",     lambda _: self._add_bar.config(bg=PANEL_BG))
+    def _snap(self):
+        w=max(COL_W*len(self._channels)+ADD_BAR_W, MIN_W)
+        self.root.minsize(w,MIN_H); self.root.geometry(f"{w}x{self.root.winfo_height() or MIN_H}")
 
-    def _on_inner_configure(self, _=None):
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
-        self._update_geometry()
+    def _on_root_configure(self, _=None):
+        zoomed=self.root.state()=="zoomed"
+        if self._was_zoomed and not zoomed:
+            w=max(COL_W*len(self._channels)+ADD_BAR_W, MIN_W)
+            self.root.geometry(f"{w}x{MIN_H}")
+        self._was_zoomed=zoomed
 
-    def _draw_add_bar(self, _=None):
-        c = self._add_bar
-        c.delete("all")
-        w, h = c.winfo_width(), c.winfo_height()
-        c.create_line(0, 0, 0, h, fill=DIVIDER, width=1)
-        c.create_text(w // 2, h // 2, text="+ Add Channel",
-                      fill=MUTED, font=("Segoe UI", 9), angle=90, anchor="center")
+    def _restore(self):
+        n=self._prefs.get("channel_count",2)
+        for i in range(n):
+            s=ChannelState.from_dict(self._prefs.get(f"ch{i}",{}))
+            self._add(s, restored=True)
 
-    def _update_geometry(self, snap=False):
-        w = max(COL_WIDTH * len(self._channels) + ADD_BAR_W, COL_MIN_W)
-        self.root.minsize(w, COL_MIN_H)
-        if snap:
-            self.root.geometry(f"{w}x{self.root.winfo_height() or COL_MIN_H}")
-
-    # ── COM names callback (called from gate thread, marshalled to main) ──────
-
-    def _on_names_ready(self, names: list[str]):
-        """Called from the COM thread; marshal device list to the main thread."""
-        self.root.after(0, self._apply_com_names, names)
-
-    def _apply_com_names(self, names: list[str]):
-        self._com_names = names
-        for ch in self._channels:
-            ch.update_device_list(names)
-            ch.attach_initial()
-
-    # ── channel management ────────────────────────────────────────────────────
-
-    def _restore_channels(self):
-        """
-        Build channel UI from prefs. Device lists are populated later when
-        _apply_com_names() arrives from the COM thread.
-        """
-        count = self._prefs.get("channel_count", 2)
-        for i in range(count):
-            self._add_channel(ChannelState.from_prefs(self._prefs.get(f"ch{i}", {})),
-                              defer_attach=True)
-
-    def _add_channel(self, state: ChannelState | None = None, defer_attach: bool = False):
-        state = state or ChannelState()
-        idx   = len(self._channels)
-        uid   = state.uid
-
-        def on_set_mute(muted: bool):
-            self._gate_q.put(("mute", uid, muted))
-
-        def on_attach(name: str):
-            def cb(result):
-                self.root.after(0, ch.on_attach_result, result)
-            self._gate_q.put(("attach", uid, (name, cb)))
-
-        def on_remove_gate():
-            self._gate_q.put(("remove", uid, None))
-
-        def is_capturing() -> bool:
-            return self._capturing is ch
-
-        def start_capture():
-            self._capturing = ch
-
-        def finish_capture(label: str):
-            self._capturing = None
-            ch._do_finish_capture(label)
-
-        def on_keybinds_changed():
-            self._rebuild_keybind_index()
-
-        ch = PTTChannel(state, idx, self.root,
-                        on_set_mute, on_attach, on_remove_gate,
-                        is_capturing, start_capture, finish_capture,
-                        on_keybinds_changed,
-                        self._remove_channel, self._save_all)
-
+    def _add(self, state=None, restored=False):
+        state=state or ChannelState()
+        idx=len(self._channels); ch=Channel(state,idx,self._bridge)
         self._channels.append(ch)
-        self._rebuild_keybind_index()
+        for label in state.keybinds: self._kb_index.setdefault(label,[]).append(ch)
+        if idx>0:
+            div=tk.Frame(self._inner, bg=DIVIDER, width=1)
+            div.pack(side="left", fill="y", before=self._bar)
+            self._dividers.append(div)
+        ch.build(self._inner).pack(side="left", fill="y", before=self._bar)
+        if restored: ch.attach_saved()
+        else: self._save(); self._enumerate_all()
+        self._snap()
 
-        if idx > 0:
-            div = tk.Frame(self._inner, bg=DIVIDER, width=1)
-            div.pack(side="left", fill="y", before=self._add_bar)
-            ch._divider_frame = div
-
-        ch.build_column(self._inner).pack(side="left", fill="y", before=self._add_bar)
-
-        if self._com_names:
-            ch.update_device_list(self._com_names)
-            if not defer_attach:
-                ch.attach_initial()
-
-        if not defer_attach:
-            self._save_all()
-        self._update_geometry(snap=True)
-
-    def _rebuild_keybind_index(self):
-        self._keybind_index.clear()
-        for ch in self._channels:
-            for label in ch.state.keybinds:
-                self._keybind_index.setdefault(label, []).append(ch)
-
-    def _remove_channel(self, ch: PTTChannel):
-        if self._capturing is ch:
-            self._capturing = None
-        self._channels.pop(self._channels.index(ch))
+    def _remove(self, ch):
+        if self._capturing is ch: self._capturing=None
+        idx=self._channels.index(ch); self._channels.pop(idx)
+        if self._dividers:
+            self._dividers.pop(max(idx-1,0)).destroy()
+        for label in list(ch.state.keybinds): self._kb_rm(label,ch)
         ch.destroy()
-        self._rebuild_keybind_index()
-        for i, c in enumerate(self._channels):
-            c.update_display_index(i)
-        self._save_all()
-        self._update_geometry(snap=True)
+        for i,c in enumerate(self._channels): c.set_index(i)
+        self._save(); self._enumerate_all(); self._snap()
 
-    # ── prefs ─────────────────────────────────────────────────────────────────
+    def _kb_add(self, label, ch): self._kb_index.setdefault(label,[]).append(ch)
+    def _kb_rm(self, label, ch):
+        b=self._kb_index.get(label)
+        if b:
+            try: b.remove(ch)
+            except ValueError: pass
+            if not b: del self._kb_index[label]
 
-    def _save_all(self):
-        data = {"channel_count": len(self._channels)}
-        data.update({f"ch{i}": ch.state.to_prefs()
-                     for i, ch in enumerate(self._channels)})
-        self._prefs = data
-        save_prefs(data)
+    def _set_capture(self, ch): self._capturing=ch
+    def _end_capture(self, ch, label): self._capturing=None; ch.accept_capture(label)
 
-    # ── input listeners ───────────────────────────────────────────────────────
+    def _start_input(self):
+        self._kb=keyboard.Listener(
+            on_press=  lambda k:self._dispatch(key_label(k),True),
+            on_release=lambda k:self._dispatch(key_label(k),False))
+        self._kb.start()
+        self._ms=mouse.Listener(
+            on_click=lambda x,y,b,p:self._dispatch(MOUSE_LABELS.get(b,str(b)),p))
+        self._ms.start()
 
-    def _start_listeners(self):
-        self._kb_listener = keyboard.Listener(
-            on_press  = lambda k: self._dispatch(key_to_label(k), True),
-            on_release= lambda k: self._dispatch(key_to_label(k), False))
-        self._kb_listener.start()
-        self._ms_listener = mouse.Listener(
-            on_click=lambda x, y, b, p: self._dispatch(
-                MOUSE_MAP.get(b, str(b)), p))
-        self._ms_listener.start()
+    def _dispatch(self, label, pressed):
+        if pressed and self._capturing:
+            self._end_capture(self._capturing, label); return
+        for ch in list(self._kb_index.get(label,[])):
+            ch.handle_press(label) if pressed else ch.handle_release(label)
 
-    def _dispatch(self, label: str, pressed: bool):
-        if pressed and self._capturing is not None:
-            self._capturing.handle_press(label)
-            return
-        fn = "handle_press" if pressed else "handle_release"
-        for ch in list(self._keybind_index.get(label, [])):
-            getattr(ch, fn)(label)
+    def _save(self):
+        data={"channel_count":len(self._channels)}
+        data.update({f"ch{i}":ch.state.to_dict() for i,ch in enumerate(self._channels)})
+        self._prefs=data; save_prefs(data)
 
-    # ── shutdown ──────────────────────────────────────────────────────────────
+    def _quit(self):
+        self._save()
+        for ch in self._channels: ch.cancel()
+        try: self._kb.stop(); self._ms.stop()
+        except: pass
+        self._audio.send("quit",None,None); self.root.destroy()
 
-    def _on_close(self):
-        self._save_all()
-        for ch in self._channels:
-            ch.cancel_timers()
-        try:
-            self._kb_listener.stop()
-            self._ms_listener.stop()
-        except Exception:
-            pass
-        self._gate_q.put(("close", None, None))
-        self._gate_thread.join(timeout=1.0)
-        self.root.destroy()
-
-
-# ── entry point ───────────────────────────────────────────────────────────────
 
 def main():
     try:
-        from ctypes import windll
-        windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
-    root = tk.Tk()
-    root.minsize(COL_MIN_W, COL_MIN_H)
-    PushToTalkApp(root)
-    root.mainloop()
+        from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
+    except: pass
+    root=tk.Tk(); root.minsize(MIN_W,MIN_H); App(root); root.mainloop()
 
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()
