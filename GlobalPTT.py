@@ -203,7 +203,7 @@ class Channel:
         self._b.on_save()
 
     def set_delay(self, ms):
-        self.state.delay_ms=ms; self._b.on_save()
+        self.state.delay_ms=ms
 
     def attach_saved(self):
         if self.state.ep_id:
