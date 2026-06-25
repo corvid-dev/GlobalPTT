@@ -103,6 +103,12 @@ class MicGate:
 
 
 class AudioThread:
+    # queue msgs: (cmd, uid, arg)
+    # enumerate: (None, None, cb)  — cb({ep_id:name}) on main thread
+    # attach:    (uid, ep_id, cb)  — cb(ok) on main thread
+    # mute:      (uid, bool, None)
+    # remove:    (uid, None, None)
+    # quit:      (None, None, None)
 
     def __init__(self, root):
         self._root=root; self._q=queue.Queue(); self._gates={}
@@ -280,7 +286,6 @@ class ChannelWidget:
         self._ep_map={}
         self.frame=self._hdr=self._svar=self._slbl=self._combo=None
         self._dvar=self._bframe=self._addbtn=self._clbl=None; self._brows=[]
-        self._delay_save_after=None
 
     def build(self, parent):
         self.frame=tk.Frame(parent, bg=COL_BG, width=COL_W); self.frame.pack_propagate(False)
@@ -308,11 +313,12 @@ class ChannelWidget:
         self._div(b)
         self._lbl(b,"Release Delay (ms)")
         self._dvar=tk.IntVar(value=self._ch.state.delay_ms)
-        self._dvar.trace_add("write", lambda *_: self._on_delay())
-        tk.Scale(b, variable=self._dvar, from_=0, to=2000, orient="horizontal",
+        self._dvar.trace_add("write", lambda *_: self._ch.set_delay(self._dvar.get()))
+        scale=tk.Scale(b, variable=self._dvar, from_=0, to=2000, orient="horizontal",
                  bg=COL_BG, fg=TEXT, troughcolor=PANEL_BG, highlightthickness=0,
-                 bd=0, activebackground=ACCENT, font=("Segoe UI",8), sliderlength=14
-                 ).pack(fill="x", pady=(2,8))
+                 bd=0, activebackground=ACCENT, font=("Segoe UI",8), sliderlength=14)
+        scale.pack(fill="x", pady=(2,8))
+        scale.bind("<ButtonRelease-1>", lambda _: self._b.on_save())
         self._div(b)
         self._lbl(b,"Keybinds")
         self._bframe=tk.Frame(b, bg=PANEL_BG); self._bframe.pack(fill="x", pady=(2,6))
@@ -355,11 +361,6 @@ class ChannelWidget:
     def _on_device_selected(self, _=None):
         sel=self._combo.current()
         self._ch.set_device("" if sel==0 else list(self._ep_map.keys())[sel-1])
-
-    def _on_delay(self):
-        self._ch.state.delay_ms=self._dvar.get()
-        if self._delay_save_after: self.frame.after_cancel(self._delay_save_after)
-        self._delay_save_after=self.frame.after(300, self._b.on_save)
 
     def _rebuild_binds(self):
         for r in self._brows: r.destroy()
