@@ -17,7 +17,7 @@ from pynput import keyboard, mouse
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize, CoCreateInstance, GUID
 
-VERSION = "1.41"
+VERSION = "1.42"
 
 # ── constants ─────────────────────────────────────────────────────────────────
 APP_BG     = "#1e1e1e"
